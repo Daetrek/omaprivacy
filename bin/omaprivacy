@@ -1,0 +1,1251 @@
+#!/usr/bin/env python3
+"""Small, auditable backend for the OmaPrivacy shell plugin."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+from datetime import datetime, timedelta, timezone
+
+
+PLUGIN_ID = "io.github.daetrek.omaprivacy"
+STATE_DIR = pathlib.Path(os.environ.get("XDG_STATE_HOME", pathlib.Path.home() / ".local/state")) / "omaprivacy"
+HISTORY_FILE = STATE_DIR / "history.json"
+CAPTURE_STATE_FILE = STATE_DIR / "captures.json"
+PRIVACY_STATE_FILE = STATE_DIR / "privacy-mode.json"
+LOCATION_SHIELD_FILE = STATE_DIR / "location-shield.json"
+CONFIG_FILE = STATE_DIR / "config.json"
+RULE_ACTION_FILE = STATE_DIR / "rule-actions.json"
+DEFAULT_CONFIG = {
+    "captureAlerts": True,
+    "autoLock": False,
+    "autoUntrustedWifi": False,
+    "trustedWifi": [],
+    "microphoneRules": {},
+    "cameraRules": {},
+    "screenRules": {},
+}
+PERMISSION_TABLES = (
+    "devices",
+    "documents",
+    "location",
+    "notifications",
+    "background",
+    "screenshot",
+    "screencast",
+    "camera",
+    "microphone",
+    "usb",
+)
+BROWSER_PERMISSION_KINDS = {
+    "geolocation": "location",
+    "media_stream_mic": "microphone",
+    "media_stream_camera": "camera",
+    "notifications": "notifications",
+}
+FIREFOX_PERMISSION_KINDS = {
+    "geo": "location",
+    "microphone": "microphone",
+    "camera": "camera",
+    "desktop-notification": "notifications",
+}
+BROWSER_PROCESS_NAMES = {
+    "brave", "brave-browser", "chrome", "chromium", "firefox", "google-chrome",
+    "microsoft-edge", "sidra", "vivaldi", "zen", "zen-bin", "zen-browser",
+}
+
+
+def run(command: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, text=True, capture_output=True, check=check)
+
+
+def read_json(path: pathlib.Path, fallback):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return fallback
+
+
+def write_json(path: pathlib.Path, value) -> None:
+    # Avoid needless filesystem churn on the three-second scan cadence. This
+    # also keeps file watchers and backup tools quiet while state is unchanged.
+    if read_json(path, object()) == value:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def config() -> dict:
+    saved = read_json(CONFIG_FILE, {})
+    return {**DEFAULT_CONFIG, **(saved if isinstance(saved, dict) else {})}
+
+
+def append_event(event: str, *, app: str = "OmaPrivacy", kind: str = "system", detail: str = "") -> None:
+    history = read_json(HISTORY_FILE, [])
+    history.append({"time": now_iso(), "event": event, "app": app, "kind": kind, "detail": detail})
+    write_json(HISTORY_FILE, history[-200:])
+
+
+def notify(title: str, body: str) -> None:
+    if shutil_which("notify-send"):
+        run(["notify-send", "--app-name=OmaPrivacy", title, body])
+
+
+def clean_label(value: object) -> str:
+    return " ".join(str(value or "").split())
+
+
+def capture_kind(props: dict) -> str:
+    media_class = str(props.get("media.class", "")).lower()
+    searchable = " ".join(
+        str(props.get(key, ""))
+        for key in ("media.role", "media.name", "node.name", "node.description")
+    ).lower()
+    if "screen" in searchable or "screencast" in searchable or "portal" in searchable:
+        return "screen"
+    if "video" in media_class:
+        return "camera"
+    return "microphone"
+
+
+def capture_label(props: dict) -> str:
+    for key in (
+        "application.name",
+        "application.process.binary",
+        "application.id",
+        "node.description",
+        "media.name",
+        "node.name",
+    ):
+        label = clean_label(props.get(key))
+        if label and label.lower() not in {"quickshell", "pipewire"}:
+            return label
+    return "Unknown application"
+
+
+def scan_captures() -> list[dict]:
+    result = run(["pw-dump"])
+    if result.returncode != 0:
+        return []
+    try:
+        objects = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    captures = []
+    for item in objects:
+        if item.get("type") != "PipeWire:Interface:Node":
+            continue
+        info = item.get("info") or {}
+        props = info.get("props") or {}
+        media_class = str(props.get("media.class", ""))
+        # PipeWire names streams from the application's point of view:
+        # Output streams are ordinary speaker playback, while Input streams
+        # deliver microphone/camera/screen data to the application.
+        if not media_class.startswith("Stream/Input/"):
+            continue
+        if info.get("state") != "running":
+            continue
+        if media_class.endswith("/Internal") or props.get("node.passive") is True:
+            continue
+        kind = capture_kind(props)
+        app = capture_label(props)
+        stable_id = clean_label(
+            props.get("object.serial")
+            or props.get("node.name")
+            or f"{kind}:{app}:{item.get('id', '')}"
+        )
+        captures.append(
+            {
+                "id": stable_id,
+                "nodeId": item.get("id"),
+                "kind": kind,
+                "app": app,
+                "detail": clean_label(props.get("media.name") or props.get("node.description")),
+            }
+        )
+    captures.sort(key=lambda row: (row["kind"], row["app"].lower(), row["id"]))
+    return captures
+
+
+def portal_proxy():
+    try:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio
+
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        return Gio.DBusProxy.new_sync(
+            bus,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            "org.freedesktop.impl.portal.PermissionStore",
+            "/org/freedesktop/impl/portal/PermissionStore",
+            "org.freedesktop.impl.portal.PermissionStore",
+            None,
+        )
+    except Exception:
+        return None
+
+
+def unpack_variant(value):
+    try:
+        return unpack_variant(value.unpack())
+    except AttributeError:
+        pass
+    if isinstance(value, dict):
+        return {str(key): unpack_variant(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [unpack_variant(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def scan_permissions() -> tuple[list[dict], str]:
+    proxy = portal_proxy()
+    if proxy is None:
+        return [], "The XDG desktop permission store is unavailable."
+    try:
+        from gi.repository import GLib
+    except Exception:
+        return [], "Python GObject bindings are unavailable."
+
+    rows = []
+    try:
+        for table in PERMISSION_TABLES:
+            listed = proxy.call_sync("List", GLib.Variant("(s)", (table,)), 0, -1, None)
+            ids = listed.unpack()[0]
+            for object_id in ids:
+                looked_up = proxy.call_sync(
+                    "Lookup", GLib.Variant("(ss)", (table, object_id)), 0, -1, None
+                )
+                permissions, _data = looked_up.unpack()
+                for app, grants in permissions.items():
+                    rows.append(
+                        {
+                            "table": table,
+                            "object": clean_label(object_id),
+                            "app": clean_label(app) or "Unknown application",
+                            "permissions": [clean_label(grant) for grant in unpack_variant(grants)],
+                        }
+                    )
+    except Exception as exc:
+        return rows, f"Could not read the XDG permission store: {clean_label(exc)}"
+    rows.sort(key=lambda row: (row["table"], row["app"].lower(), row["object"]))
+    return rows, ""
+
+
+def browser_label(path: pathlib.Path) -> str:
+    lowered = str(path).lower()
+    if "/sidra/" in lowered:
+        return "Sidra"
+    if "/bravesoftware/" in lowered:
+        return "Brave"
+    if "/google-chrome/" in lowered:
+        return "Google Chrome"
+    if "/microsoft-edge" in lowered:
+        return "Microsoft Edge"
+    if "/vivaldi/" in lowered:
+        return "Vivaldi"
+    if "/zen/" in lowered:
+        return "Zen"
+    if "/firefox/" in lowered:
+        return "Firefox"
+    return "Chromium"
+
+
+def display_origin(pattern: str) -> str:
+    origin = str(pattern).split(",", 1)[0].strip()
+    parsed = urlsplit(origin)
+    return parsed.netloc or origin
+
+
+def chromium_permissions(path: pathlib.Path) -> list[dict]:
+    preferences = read_json(path, {})
+    exceptions = (
+        preferences.get("profile", {})
+        .get("content_settings", {})
+        .get("exceptions", {})
+    )
+    rows = []
+    for setting_key, kind in BROWSER_PERMISSION_KINDS.items():
+        for pattern, decision in (exceptions.get(setting_key, {}) or {}).items():
+            value = decision.get("setting") if isinstance(decision, dict) else None
+            if value not in (1, 2):
+                continue
+            rows.append(
+                {
+                    "browser": browser_label(path),
+                    "profile": str(path),
+                    "kind": kind,
+                    "origin": display_origin(pattern),
+                    "decision": "allow" if value == 1 else "block",
+                }
+            )
+    return rows
+
+
+def firefox_permissions(path: pathlib.Path) -> list[dict]:
+    rows = []
+    # Firefox-family browsers may hold an exclusive lock for their entire
+    # session. Read a snapshot, including WAL state, instead of contending
+    # with or changing the live profile database.
+    with tempfile.TemporaryDirectory(prefix="omaprivacy-browser-") as directory:
+        snapshot = pathlib.Path(directory) / path.name
+        shutil.copyfile(path, snapshot)
+        for suffix in ("-wal", "-shm"):
+            sidecar = pathlib.Path(str(path) + suffix)
+            if sidecar.exists():
+                shutil.copyfile(sidecar, pathlib.Path(str(snapshot) + suffix))
+        connection = sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True)
+        try:
+            query = "SELECT origin, type, permission FROM moz_perms"
+            for origin, permission_type, value in connection.execute(query):
+                kind = FIREFOX_PERMISSION_KINDS.get(str(permission_type))
+                if kind is None or value not in (1, 2):
+                    continue
+                rows.append(
+                    {
+                        "browser": browser_label(path),
+                        "profile": str(path),
+                        "kind": kind,
+                        "origin": display_origin(origin),
+                        "decision": "allow" if value == 1 else "block",
+                    }
+                )
+        finally:
+            connection.close()
+    return rows
+
+
+def browser_permission_files(home: pathlib.Path | None = None) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
+    home = home or pathlib.Path.home()
+    config = home / ".config"
+    chromium = []
+    for pattern in (
+        "chromium/*/Preferences",
+        "google-chrome/*/Preferences",
+        "BraveSoftware/Brave-Browser/*/Preferences",
+        "microsoft-edge*/*/Preferences",
+        "vivaldi/*/Preferences",
+        "Sidra/Preferences",
+        "Sidra/Partitions/*/Preferences",
+    ):
+        chromium.extend(config.glob(pattern))
+    firefox = list((home / ".mozilla/firefox").glob("*/permissions.sqlite"))
+    firefox.extend((config / "zen").glob("*/permissions.sqlite"))
+    return sorted(set(chromium)), sorted(set(firefox))
+
+
+def running_browser_processes() -> list[tuple[int, str]]:
+    found = []
+    own_pid = os.getpid()
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == own_pid:
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            executable = pathlib.Path(os.readlink(entry / "exe")).name.lower()
+            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            continue
+        normalized = executable.removesuffix("-stable").removesuffix("-bin")
+        if executable not in BROWSER_PROCESS_NAMES and normalized not in BROWSER_PROCESS_NAMES:
+            continue
+        found.append((int(entry.name), browser_process_label(executable, command)))
+    return found
+
+
+def browser_process_label(executable: str, command: str) -> str:
+    lowered = f"{executable} {command}".lower()
+    if "zen" in lowered:
+        return "Zen"
+    if "sidra" in lowered:
+        return "Sidra"
+    if "firefox" in lowered:
+        return "Firefox"
+    if "brave" in lowered:
+        return "Brave"
+    if "vivaldi" in lowered:
+        return "Vivaldi"
+    if "edge" in lowered:
+        return "Microsoft Edge"
+    if "chrome" in lowered or "chromium" in lowered:
+        return "Chromium"
+    return executable
+
+
+def running_browser_labels() -> list[str]:
+    return sorted({label for _pid, label in running_browser_processes()})
+
+
+def close_all_browsers() -> None:
+    processes = running_browser_processes()
+    for pid, _label in processes:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 8
+    remaining = {pid for pid, _label in processes}
+    while remaining and time.monotonic() < deadline:
+        remaining = {pid for pid in remaining if pathlib.Path(f"/proc/{pid}").exists()}
+        if remaining:
+            time.sleep(0.1)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if any(pathlib.Path(f"/proc/{pid}").exists() for pid in remaining):
+        raise RuntimeError("Could not close every running browser")
+
+
+def browser_location_snapshot() -> list[dict]:
+    chromium_files, firefox_files = browser_permission_files()
+    snapshots = []
+    for path in chromium_files:
+        preferences = read_json(path, None)
+        if not isinstance(preferences, dict):
+            continue
+        profile = preferences.get("profile", {})
+        defaults = profile.get("default_content_setting_values", {})
+        exceptions = profile.get("content_settings", {}).get("exceptions", {})
+        snapshots.append({
+            "family": "chromium",
+            "path": str(path),
+            "hadDefault": "geolocation" in defaults,
+            "default": defaults.get("geolocation"),
+            "exceptions": exceptions.get("geolocation", {}),
+            "hadCameraDefault": "media_stream_camera" in defaults,
+            "cameraDefault": defaults.get("media_stream_camera"),
+            "cameraExceptions": exceptions.get("media_stream_camera", {}),
+        })
+    geo_pref_pattern = re.compile(r'^user_pref\("permissions\.default\.geo",.*?\);\s*$', re.MULTILINE)
+    camera_pref_pattern = re.compile(r'^user_pref\("permissions\.default\.camera",.*?\);\s*$', re.MULTILINE)
+    for database in firefox_files:
+        prefs_path = database.parent / "prefs.js"
+        prefs = prefs_path.read_text() if prefs_path.exists() else ""
+        connection = sqlite3.connect(database)
+        try:
+            permissions = list(connection.execute(
+                "SELECT origin, permission FROM moz_perms WHERE type = 'geo'"
+            ))
+            camera_permissions = list(connection.execute(
+                "SELECT origin, permission FROM moz_perms WHERE type = 'camera'"
+            ))
+        finally:
+            connection.close()
+        snapshots.append({
+            "family": "firefox",
+            "path": str(database),
+            "prefsPath": str(prefs_path),
+            "prefLines": geo_pref_pattern.findall(prefs),
+            "permissions": permissions,
+            "cameraPrefLines": camera_pref_pattern.findall(prefs),
+            "cameraPermissions": camera_permissions,
+        })
+    return snapshots
+
+
+def set_browser_location_blocked(snapshots: list[dict]) -> None:
+    geo_pref_pattern = re.compile(r'^user_pref\("permissions\.default\.geo",.*?\);\s*$', re.MULTILINE)
+    camera_pref_pattern = re.compile(r'^user_pref\("permissions\.default\.camera",.*?\);\s*$', re.MULTILINE)
+    for snapshot in snapshots:
+        if snapshot["family"] == "chromium":
+            path = pathlib.Path(snapshot["path"])
+            preferences = read_json(path, None)
+            if not isinstance(preferences, dict):
+                raise RuntimeError(f"Could not read {browser_label(path)} preferences")
+            profile = preferences.setdefault("profile", {})
+            profile.setdefault("default_content_setting_values", {})["geolocation"] = 2
+            profile.setdefault("default_content_setting_values", {})["media_stream_camera"] = 2
+            exceptions = profile.setdefault("content_settings", {}).setdefault("exceptions", {})
+            exceptions["geolocation"] = {}
+            exceptions["media_stream_camera"] = {}
+            write_json(path, preferences)
+            continue
+        database = pathlib.Path(snapshot["path"])
+        prefs_path = pathlib.Path(snapshot["prefsPath"])
+        prefs = prefs_path.read_text() if prefs_path.exists() else ""
+        prefs = geo_pref_pattern.sub("", prefs)
+        prefs = camera_pref_pattern.sub("", prefs).rstrip()
+        prefs += '\nuser_pref("permissions.default.geo", 2);\n'
+        prefs += 'user_pref("permissions.default.camera", 2);\n'
+        prefs_path.write_text(prefs)
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("UPDATE moz_perms SET permission = 2 WHERE type = 'geo'")
+            connection.execute("UPDATE moz_perms SET permission = 2 WHERE type = 'camera'")
+            connection.commit()
+        finally:
+            connection.close()
+
+
+def set_browser_geolocation_blocked(snapshots: list[dict]) -> None:
+    geo_pref_pattern = re.compile(r'^user_pref\("permissions\.default\.geo",.*?\);\s*$', re.MULTILINE)
+    for snapshot in snapshots:
+        if snapshot["family"] == "chromium":
+            path = pathlib.Path(snapshot["path"])
+            preferences = read_json(path, None)
+            if not isinstance(preferences, dict):
+                raise RuntimeError(f"Could not read {browser_label(path)} preferences")
+            profile = preferences.setdefault("profile", {})
+            profile.setdefault("default_content_setting_values", {})["geolocation"] = 2
+            profile.setdefault("content_settings", {}).setdefault("exceptions", {})["geolocation"] = {}
+            write_json(path, preferences)
+            continue
+        database = pathlib.Path(snapshot["path"])
+        prefs_path = pathlib.Path(snapshot["prefsPath"])
+        prefs = prefs_path.read_text() if prefs_path.exists() else ""
+        prefs = geo_pref_pattern.sub("", prefs).rstrip()
+        prefs += '\nuser_pref("permissions.default.geo", 2);\n'
+        prefs_path.write_text(prefs)
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("UPDATE moz_perms SET permission = 2 WHERE type = 'geo'")
+            connection.commit()
+        finally:
+            connection.close()
+
+
+def restore_browser_geolocation(snapshots: list[dict]) -> None:
+    geo_pref_pattern = re.compile(r'^user_pref\("permissions\.default\.geo",.*?\);\s*$', re.MULTILINE)
+    for snapshot in snapshots:
+        if snapshot["family"] == "chromium":
+            path = pathlib.Path(snapshot["path"])
+            preferences = read_json(path, None)
+            if not isinstance(preferences, dict):
+                continue
+            profile = preferences.setdefault("profile", {})
+            defaults = profile.setdefault("default_content_setting_values", {})
+            if snapshot["hadDefault"]:
+                defaults["geolocation"] = snapshot["default"]
+            else:
+                defaults.pop("geolocation", None)
+            profile.setdefault("content_settings", {}).setdefault("exceptions", {})["geolocation"] = snapshot["exceptions"]
+            write_json(path, preferences)
+            continue
+        database = pathlib.Path(snapshot["path"])
+        prefs_path = pathlib.Path(snapshot["prefsPath"])
+        prefs = prefs_path.read_text() if prefs_path.exists() else ""
+        prefs = geo_pref_pattern.sub("", prefs).rstrip()
+        if snapshot["prefLines"]:
+            prefs += "\n" + "\n".join(snapshot["prefLines"])
+        prefs_path.write_text(prefs + "\n")
+        connection = sqlite3.connect(database)
+        try:
+            for origin, permission in snapshot["permissions"]:
+                connection.execute(
+                    "UPDATE moz_perms SET permission = ? WHERE origin = ? AND type = 'geo'",
+                    (permission, origin),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+
+def restore_browser_location(snapshots: list[dict]) -> None:
+    geo_pref_pattern = re.compile(r'^user_pref\("permissions\.default\.geo",.*?\);\s*$', re.MULTILINE)
+    camera_pref_pattern = re.compile(r'^user_pref\("permissions\.default\.camera",.*?\);\s*$', re.MULTILINE)
+    for snapshot in snapshots:
+        if snapshot["family"] == "chromium":
+            path = pathlib.Path(snapshot["path"])
+            preferences = read_json(path, None)
+            if not isinstance(preferences, dict):
+                continue
+            profile = preferences.setdefault("profile", {})
+            defaults = profile.setdefault("default_content_setting_values", {})
+            if snapshot["hadDefault"]:
+                defaults["geolocation"] = snapshot["default"]
+            else:
+                defaults.pop("geolocation", None)
+            exceptions = profile.setdefault("content_settings", {}).setdefault("exceptions", {})
+            exceptions["geolocation"] = snapshot["exceptions"]
+            # Older Privacy Mode state files contain location only. In that
+            # case the camera was never changed, so leave it untouched.
+            if "hadCameraDefault" in snapshot:
+                if snapshot["hadCameraDefault"]:
+                    defaults["media_stream_camera"] = snapshot["cameraDefault"]
+                else:
+                    defaults.pop("media_stream_camera", None)
+                exceptions["media_stream_camera"] = snapshot["cameraExceptions"]
+            write_json(path, preferences)
+            continue
+        database = pathlib.Path(snapshot["path"])
+        prefs_path = pathlib.Path(snapshot["prefsPath"])
+        prefs = prefs_path.read_text() if prefs_path.exists() else ""
+        prefs = geo_pref_pattern.sub("", prefs).rstrip()
+        if snapshot["prefLines"]:
+            prefs += "\n" + "\n".join(snapshot["prefLines"])
+        if "cameraPrefLines" in snapshot:
+            prefs = camera_pref_pattern.sub("", prefs).rstrip()
+            if snapshot["cameraPrefLines"]:
+                prefs += "\n" + "\n".join(snapshot["cameraPrefLines"])
+        prefs_path.write_text(prefs + "\n")
+        connection = sqlite3.connect(database)
+        try:
+            for origin, permission in snapshot["permissions"]:
+                connection.execute(
+                    "UPDATE moz_perms SET permission = ? WHERE origin = ? AND type = 'geo'",
+                    (permission, origin),
+                )
+            for origin, permission in snapshot.get("cameraPermissions", []):
+                connection.execute(
+                    "UPDATE moz_perms SET permission = ? WHERE origin = ? AND type = 'camera'",
+                    (permission, origin),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+
+def scan_browser_permissions(home: pathlib.Path | None = None) -> tuple[list[dict], list[str], str]:
+    rows = []
+    errors = []
+    chromium_files, firefox_files = browser_permission_files(home)
+    profiles = sorted({browser_label(path) for path in chromium_files + firefox_files})
+    for path in chromium_files:
+        try:
+            rows.extend(chromium_permissions(path))
+        except Exception as exc:
+            errors.append(f"{browser_label(path)}: {clean_label(exc)}")
+    for path in firefox_files:
+        try:
+            rows.extend(firefox_permissions(path))
+        except Exception as exc:
+            errors.append(f"{browser_label(path)}: {clean_label(exc)}")
+    unique = {
+        (row["profile"], row["kind"], row["origin"], row["decision"]): row
+        for row in rows
+    }
+    result = sorted(
+        unique.values(),
+        key=lambda row: (row["browser"].lower(), row["origin"].lower(), row["kind"]),
+    )
+    return result, profiles, "; ".join(errors)
+
+
+def browser_health(home: pathlib.Path | None = None) -> list[dict]:
+    chromium_files, firefox_files = browser_permission_files(home)
+    rows = []
+    for path in chromium_files:
+        preferences = read_json(path, {})
+        defaults = preferences.get("profile", {}).get("default_content_setting_values", {})
+        location = defaults.get("geolocation")
+        camera = defaults.get("media_stream_camera")
+        rows.append({
+            "browser": browser_label(path), "profile": str(path),
+            "location": "blocked" if location == 2 else "ready",
+            "camera": "blocked" if camera == 2 else "ready", "backend": "Chromium service",
+        })
+    for database in firefox_files:
+        prefs = (database.parent / "prefs.js").read_text() if (database.parent / "prefs.js").exists() else ""
+        geo_blocked = bool(re.search(r'permissions\.default\.geo"\s*,\s*2', prefs))
+        camera_blocked = bool(re.search(r'permissions\.default\.camera"\s*,\s*2', prefs))
+        rows.append({
+            "browser": browser_label(database), "profile": str(database),
+            "location": "blocked" if geo_blocked else "provider-dependent",
+            "camera": "blocked" if camera_blocked else "ready", "backend": "Firefox service",
+        })
+    unique = {(row["browser"], row["profile"]): row for row in rows}
+    return sorted(unique.values(), key=lambda row: (row["browser"], row["profile"]))
+
+
+def current_wifi() -> str:
+    if not shutil_which("nmcli"):
+        return ""
+    result = run(["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"])
+    if result.returncode != 0:
+        return ""
+    for line in result.stdout.splitlines():
+        if line.startswith("yes:"):
+            return line[4:].replace("\\:", ":")
+    return ""
+
+
+def session_locked() -> bool:
+    session = os.environ.get("XDG_SESSION_ID", "")
+    if not session or not shutil_which("loginctl"):
+        return False
+    result = run(["loginctl", "show-session", session, "-p", "LockedHint", "--value"])
+    return result.returncode == 0 and result.stdout.strip().lower() == "yes"
+
+
+def automation_status() -> dict:
+    settings = config()
+    wifi = current_wifi()
+    return {**settings, "currentWifi": wifi, "locked": session_locked()}
+
+
+def configure(key: str, enabled: bool) -> dict:
+    if key not in {"captureAlerts", "autoLock", "autoUntrustedWifi"}:
+        raise RuntimeError("Unknown setting")
+    settings = config()
+    settings[key] = enabled
+    write_json(CONFIG_FILE, settings)
+    return automation_status()
+
+
+def rule_config_key(kind: str) -> str:
+    if kind not in {"microphone", "camera", "screen"}:
+        raise RuntimeError("App rules support microphone, camera, and screen capture")
+    return f"{kind}Rules"
+
+
+def set_privacy_rule(kind: str, app: str, mode: str) -> dict:
+    config_key = rule_config_key(kind)
+    app = clean_label(app)
+    if not app:
+        raise RuntimeError("An application name is required")
+    if mode not in {"default", "alert", "stop"}:
+        raise RuntimeError("Unknown app rule mode")
+    settings = config()
+    rules = settings.get(config_key, {})
+    rules = dict(rules) if isinstance(rules, dict) else {}
+    matching = next((name for name in rules if name.casefold() == app.casefold()), None)
+    if matching:
+        del rules[matching]
+    if mode != "default":
+        rules[app] = mode
+    settings[config_key] = dict(sorted(rules.items(), key=lambda item: item[0].casefold()))
+    write_json(CONFIG_FILE, settings)
+    append_event("rule-changed", app=app, kind=kind, detail=mode)
+    return automation_status()
+
+
+def capture_rule(kind: str, app: str, settings: dict | None = None) -> str:
+    rules = (settings or config()).get(rule_config_key(kind), {})
+    if not isinstance(rules, dict):
+        return "default"
+    return next(
+        (str(mode) for name, mode in rules.items() if str(name).casefold() == app.casefold()),
+        "default",
+    )
+
+
+def enforce_capture_rules(captures: list[dict]) -> list[dict]:
+    settings = config()
+    recent = read_json(RULE_ACTION_FILE, {})
+    recent = recent if isinstance(recent, dict) else {}
+    now = time.time()
+    kept = []
+    changed = False
+    for row in captures:
+        kind = row.get("kind", "")
+        if kind not in {"microphone", "camera", "screen"} or capture_rule(kind, row.get("app", ""), settings) != "stop":
+            kept.append(row)
+            continue
+        node_id = row.get("nodeId")
+        result = run(["pw-cli", "destroy", str(node_id)]) if node_id is not None and shutil_which("pw-cli") else None
+        if result is None or result.returncode != 0:
+            kept.append(row)
+            continue
+        key = f"{kind}:{row.get('app', '')}".casefold()
+        if now - float(recent.get(key, 0)) >= 30:
+            append_event("auto-stopped", app=row.get("app", "Unknown application"), kind=kind, detail="Reactive app rule")
+            notify(f"{kind.title()} capture stopped", row.get("app", "Unknown application"))
+            recent[key] = now
+            changed = True
+    if changed:
+        write_json(RULE_ACTION_FILE, recent)
+    return kept
+
+
+def trust_current_wifi() -> dict:
+    wifi = current_wifi()
+    if not wifi:
+        raise RuntimeError("No active Wi-Fi network was found")
+    settings = config()
+    settings["trustedWifi"] = sorted(set(settings.get("trustedWifi", [])) | {wifi})
+    write_json(CONFIG_FILE, settings)
+    return automation_status()
+
+
+def leak_check() -> dict:
+    result = {"publicIp": "Unavailable", "dns": [], "webrtc": "Browser test required"}
+    if shutil_which("curl"):
+        response = run(["curl", "-4", "--max-time", "4", "--silent", "https://api.ipify.org"])
+        if response.returncode == 0 and response.stdout.strip():
+            result["publicIp"] = response.stdout.strip()
+    try:
+        for line in pathlib.Path("/etc/resolv.conf").read_text().splitlines():
+            if line.startswith("nameserver "):
+                result["dns"].append(line.split(None, 1)[1])
+    except OSError:
+        pass
+    result["webrtc"] = "Browser-controlled; use a WebRTC test page"
+    append_event("checked", kind="network", detail=f"Public IP: {result['publicIp']}")
+    return result
+
+
+def revoke_all_browser_permissions(kind: str = "all") -> int:
+    if kind != "all" and kind not in set(BROWSER_PERMISSION_KINDS.values()):
+        raise RuntimeError("Unknown browser permission type")
+    rows, _profiles, error = scan_browser_permissions()
+    if error:
+        raise RuntimeError(error)
+    targets = [row for row in rows if kind == "all" or row["kind"] == kind]
+    running = running_browser_labels()
+    if running:
+        raise RuntimeError("Close running browsers before bulk cleanup: " + ", ".join(running))
+    for row in targets:
+        revoke_browser_permission(row["profile"], row["kind"], row["origin"])
+    append_event("cleaned", kind="permissions", detail=f"Revoked {len(targets)} saved browser decisions")
+    return len(targets)
+
+
+def path_lexists(path: pathlib.Path) -> bool:
+    return os.path.lexists(path)
+
+
+def browser_profile_running(path: pathlib.Path) -> bool:
+    if path.name == "Preferences":
+        # Chromium-family layouts vary: Preferences may be directly under the
+        # user-data root, under Default/Profile N, or inside an app partition.
+        config_root = pathlib.Path.home() / ".config"
+        for directory in path.parents:
+            if directory == config_root or directory == directory.parent:
+                break
+            if any(path_lexists(directory / name) for name in ("SingletonLock", "SingletonSocket")):
+                return True
+        return False
+    return any(path_lexists(path.parent / name) for name in ("parent.lock", ".parentlock"))
+
+
+def browser_permission_path(raw_path: str) -> tuple[pathlib.Path, str]:
+    requested = pathlib.Path(raw_path).expanduser().resolve()
+    chromium_files, firefox_files = browser_permission_files()
+    chromium = {path.resolve() for path in chromium_files}
+    firefox = {path.resolve() for path in firefox_files}
+    if requested in chromium:
+        return requested, "chromium"
+    if requested in firefox:
+        return requested, "firefox"
+    raise RuntimeError("Refusing an unknown browser profile")
+
+
+def backup_browser_profile(path: pathlib.Path) -> None:
+    backup_dir = STATE_DIR / "browser-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    shutil.copy2(path, backup_dir / f"{browser_label(path)}-{timestamp}-{path.name}")
+
+
+def revoke_browser_permission(raw_path: str, kind: str, origin: str) -> None:
+    path, family = browser_permission_path(raw_path)
+    if kind not in set(BROWSER_PERMISSION_KINDS.values()):
+        raise RuntimeError("Refusing an unknown browser permission type")
+    if not origin:
+        raise RuntimeError("Browser permission origin is required")
+    if browser_profile_running(path):
+        raise RuntimeError(f"Close {browser_label(path)} before revoking this saved permission")
+
+    if family == "chromium":
+        preferences = read_json(path, None)
+        if not isinstance(preferences, dict):
+            raise RuntimeError("Could not read the Chromium Preferences file")
+        setting_key = next(
+            (key for key, value in BROWSER_PERMISSION_KINDS.items() if value == kind), None
+        )
+        exceptions = (
+            preferences.get("profile", {})
+            .get("content_settings", {})
+            .get("exceptions", {})
+            .get(setting_key, {})
+        )
+        matches = [pattern for pattern in exceptions if display_origin(pattern) == origin]
+        if not matches:
+            raise RuntimeError("That saved browser permission no longer exists")
+        backup_browser_profile(path)
+        for pattern in matches:
+            del exceptions[pattern]
+        write_json(path, preferences)
+        append_event("revoked", app=browser_label(path), kind=kind, detail=origin)
+        return
+
+    permission_type = next(
+        (key for key, value in FIREFOX_PERMISSION_KINDS.items() if value == kind), None
+    )
+    connection = sqlite3.connect(path)
+    try:
+        matches = [
+            saved_origin
+            for (saved_origin,) in connection.execute(
+                "SELECT origin FROM moz_perms WHERE type = ?", (permission_type,)
+            )
+            if display_origin(saved_origin) == origin
+        ]
+        if not matches:
+            raise RuntimeError("That saved browser permission no longer exists")
+        backup_browser_profile(path)
+        for saved_origin in matches:
+            connection.execute(
+                "DELETE FROM moz_perms WHERE origin = ? AND type = ?",
+                (saved_origin, permission_type),
+            )
+        connection.commit()
+        append_event("revoked", app=browser_label(path), kind=kind, detail=origin)
+    finally:
+        connection.close()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def is_legacy_playback_event(row: dict) -> bool:
+    return (
+        row.get("event") in {"started", "stopped"}
+        and row.get("kind") == "microphone"
+        and clean_label(row.get("detail")).casefold() == "playback"
+    )
+
+
+def update_history(captures: list[dict]) -> list[dict]:
+    previous = read_json(CAPTURE_STATE_FILE, [])
+    previous = previous if isinstance(previous, list) else []
+    saved_history = read_json(HISTORY_FILE, [])
+    saved_history = saved_history if isinstance(saved_history, list) else []
+    history = [
+        row for row in saved_history
+        if isinstance(row, dict) and not is_legacy_playback_event(row)
+    ]
+    previous_by_id = {row.get("id"): row for row in previous if row.get("id")}
+    current_by_id = {row.get("id"): row for row in captures if row.get("id")}
+    timestamp = now_iso()
+
+    for capture_id in sorted(current_by_id.keys() - previous_by_id.keys()):
+        row = current_by_id[capture_id]
+        history.append({"time": timestamp, "event": "started", **row})
+        settings = config()
+        if settings.get("captureAlerts") or capture_rule(row.get("kind", "microphone"), row.get("app", ""), settings) == "alert":
+            notify(f"{row['kind'].title()} capture started", row["app"])
+    for capture_id in sorted(previous_by_id.keys() - current_by_id.keys()):
+        row = previous_by_id[capture_id]
+        history.append({"time": timestamp, "event": "stopped", **row})
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    kept = []
+    for row in history[-200:]:
+        try:
+            parsed = datetime.fromisoformat(str(row.get("time", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed >= cutoff:
+            kept.append(row)
+    write_json(CAPTURE_STATE_FILE, captures)
+    write_json(HISTORY_FILE, kept)
+    return list(reversed(kept[-30:]))
+
+
+def microphone_muted() -> bool | None:
+    result = run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"]) if shutil_which("wpctl") else None
+    if result is None or result.returncode != 0 or "Volume:" not in result.stdout:
+        return None
+    return "[MUTED]" in result.stdout
+
+
+def dnd_enabled() -> bool | None:
+    result = run(["omarchy-shell", "notifications", "dndState"])
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip().lower()
+    return value == "on" if value in {"on", "off"} else None
+
+
+def location_enabled() -> bool | None:
+    if not shutil_which("gsettings"):
+        return None
+    result = run(["gsettings", "get", "org.gnome.system.location", "enabled"])
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip().lower()
+    return value == "true" if value in {"true", "false"} else None
+
+
+def shutil_which(command: str) -> str | None:
+    from shutil import which
+
+    return which(command)
+
+
+def privacy_status() -> dict:
+    state = read_json(PRIVACY_STATE_FILE, {})
+    state = state if isinstance(state, dict) else {}
+    return {
+        "enabled": bool(state.get("enabled")),
+        "preset": state.get("preset", "lockdown" if state.get("enabled") else "normal"),
+        "microphoneMuted": microphone_muted(),
+        "dnd": dnd_enabled(),
+        "locationEnabled": location_enabled(),
+    }
+
+
+def location_shield_status() -> dict:
+    state = read_json(LOCATION_SHIELD_FILE, {})
+    state = state if isinstance(state, dict) else {}
+    return {
+        "enabled": bool(state.get("enabled")),
+        "enabledAt": state.get("enabledAt", ""),
+        "incomplete": bool(state.get("applying")),
+    }
+
+
+def location_shield_enable() -> dict:
+    state = read_json(LOCATION_SHIELD_FILE, {})
+    state = state if isinstance(state, dict) else {}
+    if state.get("enabled"):
+        return location_shield_status()
+    if privacy_status()["enabled"]:
+        raise RuntimeError("Turn off Privacy Mode before enabling Location Shield")
+    chromium_files, firefox_files = browser_permission_files()
+    if not chromium_files and not firefox_files:
+        raise RuntimeError("No supported browser profiles were found")
+    close_all_browsers()
+    if state.get("applying") and state.get("browserLocation"):
+        restore_browser_geolocation(state["browserLocation"])
+    snapshots = browser_location_snapshot()
+    if not snapshots:
+        raise RuntimeError("No supported browser profiles were found")
+    write_json(LOCATION_SHIELD_FILE, {
+        "enabled": False,
+        "applying": True,
+        "browserLocation": snapshots,
+    })
+    try:
+        set_browser_geolocation_blocked(snapshots)
+    except Exception as exc:
+        try:
+            restore_browser_geolocation(snapshots)
+        except Exception:
+            pass
+        write_json(LOCATION_SHIELD_FILE, {"enabled": False, "applying": False})
+        raise exc
+    write_json(LOCATION_SHIELD_FILE, {
+        "enabled": True,
+        "applying": False,
+        "enabledAt": now_iso(),
+        "browserLocation": snapshots,
+    })
+    append_event("enabled", kind="location-shield", detail="Precise browser geolocation blocked")
+    return location_shield_status()
+
+
+def location_shield_disable() -> dict:
+    state = read_json(LOCATION_SHIELD_FILE, {})
+    state = state if isinstance(state, dict) else {}
+    if not state.get("enabled"):
+        return location_shield_status()
+    if privacy_status()["enabled"]:
+        raise RuntimeError("Turn off Privacy Mode before disabling Location Shield")
+    close_all_browsers()
+    restore_browser_geolocation(state.get("browserLocation", []))
+    write_json(LOCATION_SHIELD_FILE, {"enabled": False, "disabledAt": now_iso()})
+    append_event("disabled", kind="location-shield", detail="Previous browser geolocation settings restored")
+    return location_shield_status()
+
+
+def set_microphone(muted: bool) -> None:
+    if not shutil_which("wpctl"):
+        raise RuntimeError("wpctl is unavailable")
+    result = run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "1" if muted else "0"])
+    if result.returncode != 0 or "Translate ID error" in result.stderr:
+        raise RuntimeError(result.stderr.strip() or "Could not change microphone mute state")
+
+
+def set_dnd(enabled: bool) -> None:
+    result = run(["omarchy-shell", "notifications", "setDnd", "on" if enabled else "off"])
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Could not change Do Not Disturb")
+
+
+def set_location(enabled: bool) -> None:
+    if not shutil_which("gsettings"):
+        raise RuntimeError("gsettings is unavailable")
+    result = run(
+        ["gsettings", "set", "org.gnome.system.location", "enabled", "true" if enabled else "false"]
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Could not change location services")
+
+
+def privacy_enable(preset: str = "lockdown") -> dict:
+    if preset not in {"meeting", "private", "lockdown"}:
+        raise RuntimeError("Unknown privacy preset")
+    existing = read_json(PRIVACY_STATE_FILE, {})
+    existing = existing if isinstance(existing, dict) else {}
+    if existing.get("enabled"):
+        privacy_disable()
+    browser_location = []
+    if preset in {"private", "lockdown"}:
+        close_all_browsers()
+        browser_location = browser_location_snapshot()
+    state = {
+        "enabled": True,
+        "preset": preset,
+        "enabledAt": now_iso(),
+        "previousMicrophoneMuted": microphone_muted(),
+        "previousDnd": dnd_enabled(),
+        "previousLocationEnabled": location_enabled(),
+        "browserLocation": browser_location,
+    }
+    write_json(PRIVACY_STATE_FILE, state)
+    try:
+        if preset == "lockdown" and state["previousMicrophoneMuted"] is not None:
+            set_microphone(True)
+        if preset in {"meeting", "lockdown"}:
+            set_dnd(True)
+        if preset in {"private", "lockdown"} and state["previousLocationEnabled"] is not None:
+            set_location(False)
+        if preset in {"private", "lockdown"}:
+            set_browser_location_blocked(browser_location)
+    except Exception:
+        privacy_disable()
+        raise
+    append_event("enabled", kind="privacy", detail=f"{preset.title()} preset")
+    return privacy_status()
+
+
+def privacy_disable() -> dict:
+    state = read_json(PRIVACY_STATE_FILE, {})
+    state = state if isinstance(state, dict) else {}
+    if state.get("enabled"):
+        preset = state.get("preset", "lockdown")
+        if preset in {"private", "lockdown"}:
+            close_all_browsers()
+        if state.get("previousMicrophoneMuted") is not None and microphone_muted() is not None:
+            set_microphone(bool(state["previousMicrophoneMuted"]))
+        if state.get("previousDnd") is not None:
+            set_dnd(bool(state["previousDnd"]))
+        if state.get("previousLocationEnabled") is not None:
+            set_location(bool(state["previousLocationEnabled"]))
+        if preset in {"private", "lockdown"}:
+            restore_browser_location(state.get("browserLocation", []))
+        append_event("disabled", kind="privacy", detail=f"{preset.title()} preset")
+    write_json(PRIVACY_STATE_FILE, {"enabled": False, "disabledAt": now_iso()})
+    return privacy_status()
+
+
+def scan() -> dict:
+    settings = automation_status()
+    privacy = privacy_status()
+    untrusted_wifi = (
+        settings.get("autoUntrustedWifi") and settings.get("currentWifi")
+        and settings["currentWifi"] not in settings.get("trustedWifi", [])
+    )
+    if not privacy["enabled"] and ((settings.get("autoLock") and settings.get("locked")) or untrusted_wifi):
+        privacy = privacy_enable("lockdown")
+    captures = enforce_capture_rules(scan_captures())
+    permissions, permission_error = scan_permissions()
+    browser_permissions, browser_profiles, browser_permission_error = scan_browser_permissions()
+    return {
+        "captures": captures,
+        "permissions": permissions,
+        "permissionError": permission_error,
+        "browserPermissions": browser_permissions,
+        "browserProfiles": browser_profiles,
+        "browserPermissionError": browser_permission_error,
+        "runningBrowsers": running_browser_labels(),
+        "history": update_history(captures),
+        "privacy": privacy,
+        "locationShield": location_shield_status(),
+        "browserHealth": browser_health(),
+        "automation": settings,
+    }
+
+
+def revoke(table: str, object_id: str, app: str) -> None:
+    if table not in PERMISSION_TABLES:
+        raise RuntimeError("Refusing an unknown permission table")
+    if not object_id or not app:
+        raise RuntimeError("Permission object and application are required")
+    proxy = portal_proxy()
+    if proxy is None:
+        raise RuntimeError("The XDG desktop permission store is unavailable")
+    from gi.repository import GLib
+
+    proxy.call_sync(
+        "DeletePermission", GLib.Variant("(sss)", (table, object_id, app)), 0, -1, None
+    )
+
+
+def main() -> int:
+    command = sys.argv[1] if len(sys.argv) > 1 else "scan"
+    try:
+        if command == "scan":
+            print(json.dumps(scan(), separators=(",", ":")))
+        elif command == "revoke" and len(sys.argv) == 5:
+            revoke(sys.argv[2], sys.argv[3], sys.argv[4])
+            print(json.dumps({"ok": True}))
+        elif command == "browser-revoke" and len(sys.argv) == 5:
+            revoke_browser_permission(sys.argv[2], sys.argv[3], sys.argv[4])
+            print(json.dumps({"ok": True}))
+        elif command == "privacy" and len(sys.argv) == 3:
+            action = sys.argv[2]
+            if action == "enable":
+                print(json.dumps(privacy_enable(), separators=(",", ":")))
+            elif action == "disable":
+                print(json.dumps(privacy_disable(), separators=(",", ":")))
+            elif action == "status":
+                print(json.dumps(privacy_status(), separators=(",", ":")))
+            else:
+                raise RuntimeError("Unknown privacy action")
+        elif command == "preset" and len(sys.argv) == 3:
+            preset = sys.argv[2]
+            print(json.dumps(privacy_disable() if preset == "normal" else privacy_enable(preset), separators=(",", ":")))
+        elif command == "location-shield" and len(sys.argv) == 3:
+            action = sys.argv[2]
+            if action == "enable":
+                print(json.dumps(location_shield_enable(), separators=(",", ":")))
+            elif action == "disable":
+                print(json.dumps(location_shield_disable(), separators=(",", ":")))
+            elif action == "status":
+                print(json.dumps(location_shield_status(), separators=(",", ":")))
+            else:
+                raise RuntimeError("Unknown Location Shield action")
+        elif command == "configure" and len(sys.argv) == 4:
+            enabled = sys.argv[3].lower() in {"1", "true", "on", "yes"}
+            print(json.dumps(configure(sys.argv[2], enabled), separators=(",", ":")))
+        elif command == "rule" and len(sys.argv) == 5:
+            print(json.dumps(set_privacy_rule(sys.argv[2], sys.argv[3], sys.argv[4]), separators=(",", ":")))
+        elif command == "trust-current-wifi" and len(sys.argv) == 2:
+            print(json.dumps(trust_current_wifi(), separators=(",", ":")))
+        elif command == "leak-check" and len(sys.argv) == 2:
+            print(json.dumps(leak_check(), separators=(",", ":")))
+        elif command == "cleanup" and len(sys.argv) in {2, 3}:
+            count = revoke_all_browser_permissions(sys.argv[2] if len(sys.argv) == 3 else "all")
+            print(json.dumps({"ok": True, "count": count}, separators=(",", ":")))
+        else:
+            raise RuntimeError("Usage: omaprivacy scan | revoke ... | browser-revoke ... | privacy ... | location-shield enable|disable|status | preset normal|meeting|private|lockdown | configure KEY on|off | rule microphone|camera|screen APP default|alert|stop | trust-current-wifi | leak-check | cleanup [KIND]")
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": clean_label(exc)}))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
