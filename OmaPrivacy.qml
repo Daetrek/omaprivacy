@@ -624,13 +624,29 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: confirm.opened
-      Keys.onPressed: function(event) {
-        if (confirm.handleKey(event)) event.accepted = true
+      // Do not install another Keys.onPressed handler here: doing so replaces
+      // PanelKeyCatcher's built-in dispatcher, including its Escape handling.
+      onMoveRequested: function(dx, dy) {
+        if (confirm.opened && dx !== 0)
+          confirm.selectedIndex = confirm.selectedIndex === 0 ? 1 : 0
       }
-      onCloseRequested: root.close()
-      onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(text) { if (text === "r" || text === "R") root.refresh() }
+      onActivateRequested: {
+        if (confirm.opened) {
+          if (confirm.selectedIndex === 0) confirm.canceled()
+          else confirm.confirmed()
+        }
+      }
+      onCloseRequested: {
+        if (confirm.opened) confirm.canceled()
+        else root.close()
+      }
+      onTabRequested: function(direction) {
+        if (confirm.opened) confirm.selectedIndex = confirm.selectedIndex === 0 ? 1 : 0
+        else root.switchPanel(direction)
+      }
+      onTextKey: function(text) {
+        if (!confirm.opened && (text === "r" || text === "R")) root.refresh()
+      }
     }
 
     Flickable {
@@ -684,6 +700,7 @@ Panel {
           ColumnLayout {
             spacing: Style.space(4)
             Button { text: root.scanLoading ? "Refreshing…" : "Refresh"; onClicked: root.refresh() }
+            Button { text: "Close"; onClicked: root.close() }
             Button {
               text: "Reload plugin"
               enabled: !reloadPluginProc.running

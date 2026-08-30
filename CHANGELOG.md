@@ -2,6 +2,11 @@
 
 All notable changes to OmaPrivacy are documented here.
 
+## 1.0.1
+
+- Added a visible Close button to the panel header and fixed the Escape-key
+  shortcut so it actually closes the panel.
+
 ## 1.0.0
 
 - Added the Overview protection grid and actionable Findings inbox.
@@ -18,4 +23,3 @@ All notable changes to OmaPrivacy are documented here.
 - Added recovery for interrupted Location Shield setup and compatibility with
   older configuration and Privacy Mode state files.
 - Removed legacy playback false-positive events and obsolete demo UI remnants.
-

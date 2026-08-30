@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.daetrek.omaprivacy",
   "name": "OmaPrivacy",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Daetrek",
   "description": "A local privacy dashboard with capture rules, reversible location and privacy controls, findings, permissions, and activity history.",
   "kinds": [
